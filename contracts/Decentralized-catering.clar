@@ -13,6 +13,13 @@
 (define-constant ERR-ALREADY-VOTED (err u107))
 (define-constant ERR-NOT-MEMBER (err u108))
 (define-constant ERR-PROPOSAL-EXPIRED (err u109))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u110))
+(define-constant ERR-MILESTONE-COMPLETED (err u111))
+(define-constant ERR-CONTRACT-NOT-FOUND (err u112))
+(define-constant ERR-INSUFFICIENT-ESCROW (err u113))
+(define-constant ERR-DISPUTE-ACTIVE (err u114))
+(define-constant ERR-NOT-CLIENT (err u115))
+(define-constant ERR-INVALID-MILESTONE (err u116))
 
 (define-constant MIN-CONTRIBUTION u1000000)
 (define-constant VOTING-PERIOD u144)
@@ -22,6 +29,9 @@
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-bid-id uint u1)
 (define-data-var total-treasury uint u0)
+(define-data-var next-contract-id uint u1)
+(define-data-var next-milestone-id uint u1)
+(define-data-var total-escrowed uint u0)
 
 (define-map members principal {
     contribution: uint,
@@ -64,6 +74,34 @@
     capacity: uint,
     rating: uint,
     total-contracts: uint
+})
+
+(define-map escrow-contracts uint {
+    bid-id: uint,
+    client: principal,
+    caterer: principal,
+    total-amount: uint,
+    escrowed-amount: uint,
+    released-amount: uint,
+    created-at: uint,
+    completed: bool,
+    disputed: bool
+})
+
+(define-map contract-milestones {contract-id: uint, milestone-id: uint} {
+    title: (string-ascii 64),
+    description: (string-ascii 256),
+    payment-amount: uint,
+    completed: bool,
+    completed-at: (optional uint),
+    disputed: bool,
+    dispute-votes-for: uint,
+    dispute-votes-against: uint
+})
+
+(define-map milestone-disputes {contract-id: uint, milestone-id: uint, voter: principal} {
+    vote: bool,
+    voting-power: uint
 })
 
 (define-public (join-coop (contribution uint))
@@ -277,6 +315,210 @@
     )
 )
 
+(define-public (create-escrow-contract (bid-id uint) (client principal) (total-amount uint))
+    (let (
+        (contract-id (var-get next-contract-id))
+        (bid-data (unwrap! (map-get? bids bid-id) ERR-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (asserts! (get selected bid-data) ERR-UNAUTHORIZED)
+        (asserts! (> total-amount u0) ERR-INVALID-AMOUNT)
+        
+        (map-set escrow-contracts contract-id {
+            bid-id: bid-id,
+            client: client,
+            caterer: (get caterer bid-data),
+            total-amount: total-amount,
+            escrowed-amount: u0,
+            released-amount: u0,
+            created-at: stacks-block-height,
+            completed: false,
+            disputed: false
+        })
+        
+        (var-set next-contract-id (+ contract-id u1))
+        (ok contract-id)
+    )
+)
+
+(define-public (create-milestone (contract-id uint) (title (string-ascii 64)) (description (string-ascii 256)) (payment-amount uint))
+    (let (
+        (milestone-id (var-get next-milestone-id))
+        (contract-data (unwrap! (map-get? escrow-contracts contract-id) ERR-CONTRACT-NOT-FOUND))
+        (caller tx-sender)
+    )
+        (asserts! (is-eq caller (get client contract-data)) ERR-NOT-CLIENT)
+        (asserts! (> payment-amount u0) ERR-INVALID-AMOUNT)
+        
+        (map-set contract-milestones {contract-id: contract-id, milestone-id: milestone-id} {
+            title: title,
+            description: description,
+            payment-amount: payment-amount,
+            completed: false,
+            completed-at: none,
+            disputed: false,
+            dispute-votes-for: u0,
+            dispute-votes-against: u0
+        })
+        
+        (var-set next-milestone-id (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (deposit-escrow (contract-id uint) (amount uint))
+    (let (
+        (contract-data (unwrap! (map-get? escrow-contracts contract-id) ERR-CONTRACT-NOT-FOUND))
+        (caller tx-sender)
+    )
+        (asserts! (is-eq caller (get client contract-data)) ERR-NOT-CLIENT)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        
+        (try! (stx-transfer? amount caller (as-contract tx-sender)))
+        
+        (map-set escrow-contracts contract-id
+            (merge contract-data {
+                escrowed-amount: (+ (get escrowed-amount contract-data) amount)
+            })
+        )
+        
+        (var-set total-escrowed (+ (var-get total-escrowed) amount))
+        (ok true)
+    )
+)
+
+(define-public (complete-milestone (contract-id uint) (milestone-id uint))
+    (let (
+        (contract-data (unwrap! (map-get? escrow-contracts contract-id) ERR-CONTRACT-NOT-FOUND))
+        (milestone-data (unwrap! (map-get? contract-milestones {contract-id: contract-id, milestone-id: milestone-id}) ERR-MILESTONE-NOT-FOUND))
+        (caller tx-sender)
+    )
+        (asserts! (is-eq caller (get caterer contract-data)) ERR-UNAUTHORIZED)
+        (asserts! (not (get completed milestone-data)) ERR-MILESTONE-COMPLETED)
+        (asserts! (not (get disputed milestone-data)) ERR-DISPUTE-ACTIVE)
+        (asserts! (>= (get escrowed-amount contract-data) (get payment-amount milestone-data)) ERR-INSUFFICIENT-ESCROW)
+        
+        (map-set contract-milestones {contract-id: contract-id, milestone-id: milestone-id}
+            (merge milestone-data {
+                completed: true,
+                completed-at: (some stacks-block-height)
+            })
+        )
+        
+        (try! (as-contract (stx-transfer? (get payment-amount milestone-data) tx-sender (get caterer contract-data))))
+        
+        (map-set escrow-contracts contract-id
+            (merge contract-data {
+                escrowed-amount: (- (get escrowed-amount contract-data) (get payment-amount milestone-data)),
+                released-amount: (+ (get released-amount contract-data) (get payment-amount milestone-data))
+            })
+        )
+        
+        (var-set total-escrowed (- (var-get total-escrowed) (get payment-amount milestone-data)))
+        (ok true)
+    )
+)
+
+(define-public (dispute-milestone (contract-id uint) (milestone-id uint))
+    (let (
+        (contract-data (unwrap! (map-get? escrow-contracts contract-id) ERR-CONTRACT-NOT-FOUND))
+        (milestone-data (unwrap! (map-get? contract-milestones {contract-id: contract-id, milestone-id: milestone-id}) ERR-MILESTONE-NOT-FOUND))
+        (caller tx-sender)
+    )
+        (asserts! (is-eq caller (get client contract-data)) ERR-NOT-CLIENT)
+        (asserts! (get completed milestone-data) ERR-INVALID-MILESTONE)
+        (asserts! (not (get disputed milestone-data)) ERR-DISPUTE-ACTIVE)
+        
+        (map-set contract-milestones {contract-id: contract-id, milestone-id: milestone-id}
+            (merge milestone-data {disputed: true})
+        )
+        
+        (map-set escrow-contracts contract-id
+            (merge contract-data {disputed: true})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (vote-on-dispute (contract-id uint) (milestone-id uint) (vote bool))
+    (let (
+        (caller tx-sender)
+        (member-data (unwrap! (map-get? members caller) ERR-NOT-MEMBER))
+        (milestone-data (unwrap! (map-get? contract-milestones {contract-id: contract-id, milestone-id: milestone-id}) ERR-MILESTONE-NOT-FOUND))
+        (vote-key {contract-id: contract-id, milestone-id: milestone-id, voter: caller})
+        (existing-vote (map-get? milestone-disputes vote-key))
+    )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (get disputed milestone-data) ERR-INVALID-MILESTONE)
+        (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+        
+        (let (
+            (voting-power (get voting-power member-data))
+            (current-for (get dispute-votes-for milestone-data))
+            (current-against (get dispute-votes-against milestone-data))
+        )
+            (map-set milestone-disputes vote-key {
+                vote: vote,
+                voting-power: voting-power
+            })
+            
+            (map-set contract-milestones {contract-id: contract-id, milestone-id: milestone-id}
+                (merge milestone-data {
+                    dispute-votes-for: (if vote (+ current-for voting-power) current-for),
+                    dispute-votes-against: (if vote current-against (+ current-against voting-power))
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (resolve-dispute (contract-id uint) (milestone-id uint))
+    (let (
+        (contract-data (unwrap! (map-get? escrow-contracts contract-id) ERR-CONTRACT-NOT-FOUND))
+        (milestone-data (unwrap! (map-get? contract-milestones {contract-id: contract-id, milestone-id: milestone-id}) ERR-MILESTONE-NOT-FOUND))
+        (total-dispute-votes (+ (get dispute-votes-for milestone-data) (get dispute-votes-against milestone-data)))
+        (dispute-approved (> (get dispute-votes-for milestone-data) (get dispute-votes-against milestone-data)))
+    )
+        (asserts! (get disputed milestone-data) ERR-INVALID-MILESTONE)
+        (asserts! (>= total-dispute-votes MIN-QUORUM) ERR-INVALID-AMOUNT)
+        
+        (if dispute-approved
+            (begin
+                (try! (as-contract (stx-transfer? (get payment-amount milestone-data) tx-sender (get client contract-data))))
+                
+                (map-set escrow-contracts contract-id
+                    (merge contract-data {
+                        escrowed-amount: (- (get escrowed-amount contract-data) (get payment-amount milestone-data)),
+                        disputed: false
+                    })
+                )
+                
+                (map-set contract-milestones {contract-id: contract-id, milestone-id: milestone-id}
+                    (merge milestone-data {
+                        completed: false,
+                        completed-at: none,
+                        disputed: false
+                    })
+                )
+            )
+            (begin
+                (map-set contract-milestones {contract-id: contract-id, milestone-id: milestone-id}
+                    (merge milestone-data {disputed: false})
+                )
+                
+                (map-set escrow-contracts contract-id
+                    (merge contract-data {disputed: false})
+                )
+            )
+        )
+        
+        (var-set total-escrowed (- (var-get total-escrowed) (get payment-amount milestone-data)))
+        (ok dispute-approved)
+    )
+)
+
 (define-read-only (get-member (member principal))
     (map-get? members member)
 )
@@ -303,4 +545,37 @@
 
 (define-read-only (get-contract-owner)
     (var-get contract-owner)
+)
+
+(define-read-only (get-escrow-contract (contract-id uint))
+    (map-get? escrow-contracts contract-id)
+)
+
+(define-read-only (get-contract-milestone (contract-id uint) (milestone-id uint))
+    (map-get? contract-milestones {contract-id: contract-id, milestone-id: milestone-id})
+)
+
+(define-read-only (get-milestone-dispute-vote (contract-id uint) (milestone-id uint) (voter principal))
+    (map-get? milestone-disputes {contract-id: contract-id, milestone-id: milestone-id, voter: voter})
+)
+
+(define-read-only (get-total-escrowed)
+    (var-get total-escrowed)
+)
+
+(define-read-only (get-contract-progress (contract-id uint))
+    (match (map-get? escrow-contracts contract-id)
+        contract-data (ok {
+            total-amount: (get total-amount contract-data),
+            escrowed-amount: (get escrowed-amount contract-data),
+            released-amount: (get released-amount contract-data),
+            completion-percentage: (if (> (get total-amount contract-data) u0)
+                (/ (* (get released-amount contract-data) u100) (get total-amount contract-data))
+                u0
+            ),
+            disputed: (get disputed contract-data),
+            completed: (get completed contract-data)
+        })
+        ERR-CONTRACT-NOT-FOUND
+    )
 )
