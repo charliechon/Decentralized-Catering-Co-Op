@@ -20,6 +20,8 @@
 (define-constant ERR-DISPUTE-ACTIVE (err u114))
 (define-constant ERR-NOT-CLIENT (err u115))
 (define-constant ERR-INVALID-MILESTONE (err u116))
+(define-constant ERR-NO-DIVIDENDS (err u117))
+(define-constant ERR-ALREADY-CLAIMED (err u118))
 
 (define-constant MIN-CONTRIBUTION u1000000)
 (define-constant VOTING-PERIOD u144)
@@ -32,6 +34,8 @@
 (define-data-var next-contract-id uint u1)
 (define-data-var next-milestone-id uint u1)
 (define-data-var total-escrowed uint u0)
+(define-data-var next-dividend-pool-id uint u1)
+(define-data-var total-dividends-distributed uint u0)
 
 (define-map members principal {
     contribution: uint,
@@ -102,6 +106,21 @@
 (define-map milestone-disputes {contract-id: uint, milestone-id: uint, voter: principal} {
     vote: bool,
     voting-power: uint
+})
+
+(define-map dividend-pools uint {
+    source-contract-id: uint,
+    total-amount: uint,
+    total-contribution-snapshot: uint,
+    created-at: uint,
+    distributed: bool,
+    claimed-amount: uint
+})
+
+(define-map dividend-claims {pool-id: uint, member: principal} {
+    claimed: bool,
+    claim-amount: uint,
+    claimed-at: (optional uint)
 })
 
 (define-public (join-coop (contribution uint))
@@ -578,4 +597,139 @@
         })
         ERR-CONTRACT-NOT-FOUND
     )
+)
+
+(define-public (create-dividend-pool (source-contract-id uint) (profit-amount uint))
+    (let (
+        (pool-id (var-get next-dividend-pool-id))
+        (contract-data (unwrap! (map-get? escrow-contracts source-contract-id) ERR-CONTRACT-NOT-FOUND))
+        (current-treasury (var-get total-treasury))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (asserts! (> profit-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (get completed contract-data) ERR-INVALID-MILESTONE)
+        
+        (try! (stx-transfer? profit-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set dividend-pools pool-id {
+            source-contract-id: source-contract-id,
+            total-amount: profit-amount,
+            total-contribution-snapshot: current-treasury,
+            created-at: stacks-block-height,
+            distributed: false,
+            claimed-amount: u0
+        })
+        
+        (var-set next-dividend-pool-id (+ pool-id u1))
+        (ok pool-id)
+    )
+)
+
+(define-public (claim-dividend (pool-id uint))
+    (let (
+        (pool-data (unwrap! (map-get? dividend-pools pool-id) ERR-NOT-FOUND))
+        (member-data (unwrap! (map-get? members tx-sender) ERR-NOT-MEMBER))
+        (claim-key {pool-id: pool-id, member: tx-sender})
+        (existing-claim (map-get? dividend-claims claim-key))
+    )
+        (asserts! (get active member-data) ERR-NOT-MEMBER)
+        (asserts! (is-none existing-claim) ERR-ALREADY-CLAIMED)
+        
+        (let (
+            (member-contribution (get contribution member-data))
+            (total-snapshot (get total-contribution-snapshot pool-data))
+            (dividend-share (if (> total-snapshot u0)
+                (/ (* (get total-amount pool-data) member-contribution) total-snapshot)
+                u0
+            ))
+        )
+            (asserts! (> dividend-share u0) ERR-NO-DIVIDENDS)
+            
+            (try! (as-contract (stx-transfer? dividend-share tx-sender tx-sender)))
+            
+            (map-set dividend-claims claim-key {
+                claimed: true,
+                claim-amount: dividend-share,
+                claimed-at: (some stacks-block-height)
+            })
+            
+            (map-set dividend-pools pool-id
+                (merge pool-data {
+                    claimed-amount: (+ (get claimed-amount pool-data) dividend-share)
+                })
+            )
+            
+            (var-set total-dividends-distributed (+ (var-get total-dividends-distributed) dividend-share))
+            (ok dividend-share)
+        )
+    )
+)
+
+(define-public (mark-pool-distributed (pool-id uint))
+    (let (
+        (pool-data (unwrap! (map-get? dividend-pools pool-id) ERR-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (asserts! (not (get distributed pool-data)) ERR-ALREADY-EXISTS)
+        
+        (map-set dividend-pools pool-id
+            (merge pool-data {distributed: true})
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dividend-pool (pool-id uint))
+    (map-get? dividend-pools pool-id)
+)
+
+(define-read-only (get-dividend-claim (pool-id uint) (member principal))
+    (map-get? dividend-claims {pool-id: pool-id, member: member})
+)
+
+(define-read-only (calculate-member-dividend-share (pool-id uint) (member principal))
+    (match (map-get? dividend-pools pool-id)
+        pool-data
+            (match (map-get? members member)
+                member-data
+                    (let (
+                        (member-contribution (get contribution member-data))
+                        (total-snapshot (get total-contribution-snapshot pool-data))
+                        (share (if (> total-snapshot u0)
+                            (/ (* (get total-amount pool-data) member-contribution) total-snapshot)
+                            u0
+                        ))
+                    )
+                        (ok {
+                            eligible-amount: share,
+                            member-contribution: member-contribution,
+                            total-pool: (get total-amount pool-data),
+                            contribution-percentage: (if (> total-snapshot u0)
+                                (/ (* member-contribution u10000) total-snapshot)
+                                u0
+                            )
+                        })
+                    )
+                ERR-NOT-MEMBER
+            )
+        ERR-NOT-FOUND
+    )
+)
+
+(define-read-only (get-total-dividends-distributed)
+    (var-get total-dividends-distributed)
+)
+
+(define-read-only (get-unclaimed-dividends (pool-id uint))
+    (match (map-get? dividend-pools pool-id)
+        pool-data (ok (- (get total-amount pool-data) (get claimed-amount pool-data)))
+        ERR-NOT-FOUND
+    )
+)
+
+(define-read-only (get-member-dividend-history (member principal))
+    (ok {
+        total-pools-available: (- (var-get next-dividend-pool-id) u1),
+        total-dividends-distributed: (var-get total-dividends-distributed)
+    })
 )
