@@ -22,6 +22,9 @@
 (define-constant ERR-INVALID-MILESTONE (err u116))
 (define-constant ERR-NO-DIVIDENDS (err u117))
 (define-constant ERR-ALREADY-CLAIMED (err u118))
+(define-constant ERR-ALREADY-REVIEWED (err u119))
+(define-constant ERR-CONTRACT-NOT-COMPLETED (err u120))
+(define-constant ERR-INVALID-RATING (err u121))
 
 (define-constant MIN-CONTRIBUTION u1000000)
 (define-constant VOTING-PERIOD u144)
@@ -36,6 +39,7 @@
 (define-data-var total-escrowed uint u0)
 (define-data-var next-dividend-pool-id uint u1)
 (define-data-var total-dividends-distributed uint u0)
+(define-data-var next-review-id uint u1)
 
 (define-map members principal {
     contribution: uint,
@@ -121,6 +125,25 @@
     claimed: bool,
     claim-amount: uint,
     claimed-at: (optional uint)
+})
+
+(define-map reviews uint {
+    contract-id: uint,
+    reviewer: principal,
+    caterer: principal,
+    rating: uint,
+    feedback: (string-ascii 256),
+    created-at: uint
+})
+
+(define-map contract-reviewed uint bool)
+
+(define-map caterer-reputation principal {
+    total-reviews: uint,
+    cumulative-rating: uint,
+    average-rating: uint,
+    highest-rating: uint,
+    lowest-rating: uint
 })
 
 (define-public (join-coop (contribution uint))
@@ -732,4 +755,84 @@
         total-pools-available: (- (var-get next-dividend-pool-id) u1),
         total-dividends-distributed: (var-get total-dividends-distributed)
     })
+)
+
+(define-public (submit-review (contract-id uint) (rating uint) (feedback (string-ascii 256)))
+    (let (
+        (review-id (var-get next-review-id))
+        (contract-data (unwrap! (map-get? escrow-contracts contract-id) ERR-CONTRACT-NOT-FOUND))
+        (already-reviewed (default-to false (map-get? contract-reviewed contract-id)))
+        (caterer (get caterer contract-data))
+    )
+        (asserts! (is-eq tx-sender (get client contract-data)) ERR-NOT-CLIENT)
+        (asserts! (get completed contract-data) ERR-CONTRACT-NOT-COMPLETED)
+        (asserts! (not already-reviewed) ERR-ALREADY-REVIEWED)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+
+        (map-set reviews review-id {
+            contract-id: contract-id,
+            reviewer: tx-sender,
+            caterer: caterer,
+            rating: rating,
+            feedback: feedback,
+            created-at: stacks-block-height
+        })
+
+        (map-set contract-reviewed contract-id true)
+
+        (let (
+            (current-rep (default-to
+                {total-reviews: u0, cumulative-rating: u0, average-rating: u0, highest-rating: u0, lowest-rating: u5}
+                (map-get? caterer-reputation caterer)
+            ))
+            (new-total (+ (get total-reviews current-rep) u1))
+            (new-cumulative (+ (get cumulative-rating current-rep) rating))
+            (new-highest (if (> rating (get highest-rating current-rep)) rating (get highest-rating current-rep)))
+            (new-lowest (if (< rating (get lowest-rating current-rep)) rating (get lowest-rating current-rep)))
+        )
+            (map-set caterer-reputation caterer {
+                total-reviews: new-total,
+                cumulative-rating: new-cumulative,
+                average-rating: (/ new-cumulative new-total),
+                highest-rating: new-highest,
+                lowest-rating: new-lowest
+            })
+        )
+
+        (var-set next-review-id (+ review-id u1))
+        (ok review-id)
+    )
+)
+
+(define-read-only (get-review (review-id uint))
+    (map-get? reviews review-id)
+)
+
+(define-read-only (get-caterer-reputation (caterer principal))
+    (map-get? caterer-reputation caterer)
+)
+
+(define-read-only (get-contract-review-status (contract-id uint))
+    (default-to false (map-get? contract-reviewed contract-id))
+)
+
+(define-read-only (get-caterer-trust-score (caterer principal))
+    (match (map-get? caterer-reputation caterer)
+        rep-data
+            (let (
+                (avg (get average-rating rep-data))
+                (count (get total-reviews rep-data))
+                (base-score (* avg u20))
+                (volume-bonus (if (>= count u10) u10 (if (>= count u5) u5 u0)))
+            )
+                (ok {
+                    trust-score: (+ base-score volume-bonus),
+                    total-reviews: count,
+                    average-rating: avg,
+                    highest-rating: (get highest-rating rep-data),
+                    lowest-rating: (get lowest-rating rep-data)
+                })
+            )
+        ERR-NOT-FOUND
+    )
 )
